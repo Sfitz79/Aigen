@@ -1,1 +1,81 @@
+# Keeps the aigen workforce ticking, 24/7, with no browser and no interaction.
+#
+# WHY THIS EXISTS, measured 2026-10-01: the workforce was only ever triggered by
+# the Boss's browser - TopBar, WorkforcePanel, LogsPanel and SocialPanel all POST
+# /api/workforce - so closing the tab stopped all 22 jobs and every department.
+#
+# WHY NOT VERCEL CRON: Vercel's docs are explicit that the Hobby plan runs cron
+# ONCE PER DAY, and that a sub-daily expression fails deployment. aigen is Hobby.
+# This workflow is therefore the real spine, and the once-a-day Vercel cron is
+# kept only as a backstop in case this stops.
+#
+# THIS REPO DOES NOT NEED TO CONTAIN AIGEN'S SOURCE. Any GitHub repo will do -
+# the job is a single HTTP call. aigen currently has no git remote, so this file
+# can live in a small dedicated repo rather than exposing the app's code.
+#
+# SETUP (one-time):
+#   1. Repo -> Settings -> Secrets and variables -> Actions -> New repository
+#      secret: CRON_SECRET  (the SAME value as the Vercel CRON_SECRET)
+#   2. Commit this file to .github/workflows/heartbeat.yml
+#   3. Actions tab -> enable the workflow
+#
+# Scheduled workflows on the free tier run no more often than every 5 minutes,
+# which is why the interval is 5 and not 1. That is fine: the endpoint is
+# idempotent and self-throttling - runWorkforceTick skips any job whose interval
+# has not elapsed - so extra calls cost almost nothing and do no duplicate work.
 
+name: aigen workforce heartbeat
+
+on:
+  schedule:
+    # Every 5 minutes. Cron in GitHub Actions is UTC.
+    - cron: '*/5 * * * *'
+  # Lets you prove it works from the Actions tab without waiting for the schedule.
+  workflow_dispatch:
+
+concurrency:
+  # Never let two heartbeats overlap. The endpoint has its own busy guard, but a
+  # scheduled run that piles up behind a slow tick is wasted quota.
+  group: aigen-heartbeat
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    name: Tick the workforce
+    runs-on: ubuntu-latest
+    # A tick can run many jobs. Give it room, but do not let a hung request sit
+    # for the default 6 minutes burning runner time.
+    timeout-minutes: 5
+    steps:
+      - name: Tick aigen workforce
+        env:
+          # Read from the repo secret, never echoed. If it is missing the step
+          # fails loudly rather than sending an empty bearer token.
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          if [ -z "$CRON_SECRET" ]; then
+            echo "::error::CRON_SECRET is not set on this repository. Add it under Settings > Secrets > Actions, or every run will fail."
+            exit 1
+          fi
+          url="https://aigen.pctechguy.app/api/cron/workforce"
+          started=$(date -u +%s)
+          code=$(curl -sS -o /tmp/body.txt -w '%{http_code}' \
+            --max-time 240 \
+            -H "Authorization: Bearer $CRON_SECRET" \
+            "$url" || echo "000")
+          echo "HTTP $code in $(( $(date -u +%s) - started ))s"
+          cat /tmp/body.txt; echo
+          if [ "$code" != "200" ]; then
+            echo "::error::Heartbeat returned HTTP $code - the workforce is NOT being ticked."
+            exit 1
+          fi
+
+      - name: Notify on repeated failure
+        # Only worth alerting when it has been broken for a while, not on a single
+        # blip. The condition checks that this run failed AND the previous one did
+        # too, so a transient network error does not page anyone.
+        if: failure() && github.run_attempt == 1
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.warning('aigen workforce heartbeat failed. Check /api/health/storage and the Vercel deployment.');
