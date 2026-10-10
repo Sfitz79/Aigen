@@ -58,17 +58,30 @@ jobs:
             exit 1
           fi
           url="https://aigen.pctechguy.app/api/cron/workforce"
-          started=$(date -u +%s)
-          code=$(curl -sS -o /tmp/body.txt -w '%{http_code}' \
-            --max-time 240 \
-            -H "Authorization: Bearer $CRON_SECRET" \
-            "$url" || echo "000")
-          echo "HTTP $code in $(( $(date -u +%s) - started ))s"
+          # 2026-10-10: the tunnel flaps in short bursts (QUIC keepalive timeouts
+          # produced HTTP 530 for a single scheduled tick at 16:23Z). Retry so a
+          # transient origin flap does not fail the run; still fail loudly - with a
+          # per-attempt cap so three tries fit inside the 5-minute timeout.
+          for attempt in 1 2 3; do
+            code=$(curl -sS -o /tmp/body.txt -w '%{http_code}' \
+              --max-time 60 \
+              -H "Authorization: Bearer $CRON_SECRET" \
+              "$url" || echo "000")
+            echo "attempt $attempt: HTTP $code"
+            if [ "$code" = "200" ]; then
+              cat /tmp/body.txt; echo
+              exit 0
+            fi
+            # Auth and routing failures never heal by retrying - fail immediately.
+            if [ "$code" = "401" ] || [ "$code" = "403" ] || [ "$code" = "404" ]; then
+              echo "::error::Heartbeat returned HTTP $code - the workforce is NOT being ticked."
+              exit 1
+            fi
+            [ "$attempt" -lt 3 ] && sleep 10
+          done
           cat /tmp/body.txt; echo
-          if [ "$code" != "200" ]; then
-            echo "::error::Heartbeat returned HTTP $code - the workforce is NOT being ticked."
-            exit 1
-          fi
+          echo "::error::Heartbeat returned HTTP $code after 3 attempts - the workforce is NOT being ticked."
+          exit 1
 
       - name: Notify on repeated failure
         # Only worth alerting when it has been broken for a while, not on a single
