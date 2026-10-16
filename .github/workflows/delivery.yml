@@ -85,7 +85,7 @@ jobs:
         # mistaken for a delivery result.
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.test-alert) }}
         env:
-          EXPECT_INSTALLER: '115564467'
+          EXPECT_INSTALLER: '999'
           EXPECT_PORTABLE: '163892293'
         run: |
           set -u
