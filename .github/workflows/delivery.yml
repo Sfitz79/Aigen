@@ -33,6 +33,11 @@ on:
     # scheduled job on the planet and GitHub delays queued runs.
     - cron: '17 */6 * * *'
   workflow_dispatch:
+    inputs:
+      test-alert:
+        description: 'Send a test notification to the Boss and nothing else'
+        type: boolean
+        default: false
 
 concurrency:
   group: pctg-delivery
@@ -44,7 +49,41 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Test notification only
+        # Proves the alert lane itself works, without breaking anything. If the
+        # Boss ever stops getting pushes, the first thing to suspect is this.
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.test-alert }}
+        env:
+          NTFY_TOPIC: ${{ secrets.PCTG_NTFY_TOPIC }}
+        run: |
+          set -u
+          if [ -z "${NTFY_TOPIC:-}" ]; then
+            echo "::error::PCTG_NTFY_TOPIC is not set on this repository, so no notification can be sent. Add it under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          # The topic is posted in the JSON BODY, never in the URL, so it cannot
+          # leak into a shell trace, a redirect target or a proxy log.
+          title="PCTG Optimizer - test notification"
+          message="PCTG Optimizer delivery probe: the ntfy alert lane works. Ignore this, nothing is broken."
+          # jq is preinstalled on ubuntu runners, but an alert that silently
+          # depends on it is exactly the kind that goes missing. printf is the
+          # fallback, and it is safe here because every character is ours.
+          if command -v jq >/dev/null 2>&1; then
+            payload=$(jq -n --arg t "$NTFY_TOPIC" --arg ti "$title" --arg m "$message" \
+              '{topic:$t, title:$ti, message:$m, priority:3, tags:["white_check_mark"]}')
+          else
+            payload=$(printf '{"topic":"%s","title":"%s","message":"%s","priority":3}' "$NTFY_TOPIC" "$title" "$message")
+          fi
+          code=$(curl -sS --max-time 20 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d "$payload" https://ntfy.sh || true)
+          [ "${#code}" -eq 3 ] || code=000
+          echo "ntfy HTTP $code"
+          [ "$code" = "200" ] || { echo "::error::The test notification did not send."; exit 1; }
+          echo "Test notification sent."
+
       - name: Unauthenticated delivery probe
+        # Skipped on a test-alert dispatch so proving the alert lane can never be
+        # mistaken for a delivery result.
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.test-alert) }}
         env:
           EXPECT_INSTALLER: '115564467'
           EXPECT_PORTABLE: '163892293'
@@ -109,3 +148,38 @@ jobs:
             echo "::error::CUSTOMERS CANNOT DOWNLOAD WHAT THEY PAID FOR."
           fi
           exit "$fail"
+
+      - name: Alert the Boss (ntfy push)
+        # Any failure here is alerted immediately, with no "second strike" rule.
+        # A dead download button is lost revenue, and this probe runs every six
+        # hours, so a real outage is worth waking someone for. The heartbeat's
+        # noisier transport flapping is the one that waits for two strikes.
+        if: failure()
+        env:
+          NTFY_TOPIC: ${{ secrets.PCTG_NTFY_TOPIC }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -u
+          if [ -z "${NTFY_TOPIC:-}" ]; then
+            echo "::warning::PCTG_NTFY_TOPIC is not set on this repository, so this failure is silent. Add it under Settings > Secrets and variables > Actions."
+            exit 0
+          fi
+          # The failing step's own ::error:: lines already say what is wrong; this
+          # only has to say THAT it is wrong and where to look.
+          title="PCTG Optimizer - DELIVERY BROKEN"
+          message="Customers may not be able to download the Optimizer: the storefront /download chain did not deliver both binaries at their expected size. Most common cause is the release repo going private (fix: gh api -X PATCH repos/Sfitz79/pctg-system-optimizer -f private=false). Run: $RUN_URL"
+          if command -v jq >/dev/null 2>&1; then
+            payload=$(jq -n --arg t "$NTFY_TOPIC" --arg ti "$title" --arg m "$message" \
+              '{topic:$t, title:$ti, message:$m, priority:5, tags:["rotating_light","skull"]}')
+          else
+            payload=$(printf '{"topic":"%s","title":"%s","message":"%s","priority":5}' "$NTFY_TOPIC" "$title" "$message")
+          fi
+          code=$(curl -sS --max-time 20 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d "$payload" https://ntfy.sh || true)
+          [ "${#code}" -eq 3 ] || code=000
+          if [ "$code" != "200" ]; then
+            # Loud, because a broken alert is worse than no alert: it looks like
+            # the system is being watched when nothing is watching.
+            echo "::error::The alert itself FAILED to send (ntfy HTTP $code). Nobody has been told."
+            exit 1
+          fi
+          echo "Alert sent."
