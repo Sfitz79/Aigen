@@ -32,6 +32,11 @@ on:
     - cron: '*/5 * * * *'
   # Lets you prove it works from the Actions tab without waiting for the schedule.
   workflow_dispatch:
+    inputs:
+      test-alert:
+        description: 'Send a test notification to the Boss and nothing else'
+        type: boolean
+        default: false
 
 concurrency:
   # Never let two heartbeats overlap. The endpoint has its own busy guard, but a
@@ -47,7 +52,33 @@ jobs:
     # for the default 6 minutes burning runner time.
     timeout-minutes: 5
     steps:
+      - name: Test notification only
+        # Proves the alert lane without ticking or breaking anything.
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.test-alert }}
+        env:
+          NTFY_TOPIC: ${{ secrets.PCTG_NTFY_TOPIC }}
+        run: |
+          set -u
+          if [ -z "${NTFY_TOPIC:-}" ]; then
+            echo "::error::PCTG_NTFY_TOPIC is not set on this repository, so no notification can be sent."
+            exit 1
+          fi
+          title="aigen heartbeat - test notification"
+          message="Test notification from the workforce heartbeat. Ignore this, nothing is broken."
+          if command -v jq >/dev/null 2>&1; then
+            payload=$(jq -n --arg t "$NTFY_TOPIC" --arg ti "$title" --arg m "$message" \
+              '{topic:$t, title:$ti, message:$m, priority:3, tags:["white_check_mark"]}')
+          else
+            payload=$(printf '{"topic":"%s","title":"%s","message":"%s","priority":3}' "$NTFY_TOPIC" "$title" "$message")
+          fi
+          code=$(curl -sS --max-time 20 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d "$payload" https://ntfy.sh || true)
+          [ "${#code}" -eq 3 ] || code=000
+          echo "ntfy HTTP $code"
+          [ "$code" = "200" ] || { echo "::error::The test notification did not send."; exit 1; }
+          echo "Test notification sent."
+
       - name: Tick aigen workforce
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.test-alert) }}
         env:
           # Read from the repo secret, never echoed. If it is missing the step
           # fails loudly rather than sending an empty bearer token.
@@ -92,3 +123,54 @@ jobs:
         with:
           script: |
             core.warning('aigen workforce heartbeat failed. Check /api/health/storage and the Vercel deployment.');
+
+      - name: Alert the Boss (ntfy push)
+        # WHY THIS EXISTED AS A WARNING ONLY, measured 2026-10-16: seven consecutive
+        # runs failed HTTP 530 for about eighteen hours, and a core.warning() goes
+        # nowhere - GitHub deliberately stopped emailing on failed SCHEDULED
+        # workflows, so the operator was never told. The workforce simply stopped
+        # ticking and nobody noticed.
+        #
+        # The push has to leave from HERE, not from the studio. A 530 means the
+        # runner cannot reach the origin, so any alert sent by the studio would
+        # die in exactly the outage it was reporting.
+        #
+        # TWO STRIKES, unlike the delivery probe: this endpoint runs every five
+        # minutes against a tunnel that flaps, so one failed run is weather, not
+        # news. Two consecutive completed failures is an outage.
+        if: failure() && github.run_attempt == 1
+        env:
+          NTFY_TOPIC: ${{ secrets.PCTG_NTFY_TOPIC }}
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -u
+          previous=$(gh run list --workflow heartbeat.yml --limit 10 --json conclusion,status \
+            --jq '[.[] | select(.status == "completed")][0].conclusion' 2>/dev/null || echo unknown)
+          echo "previous completed run: ${previous:-unknown}"
+          if [ "${previous:-unknown}" = "success" ]; then
+            echo "Only the first failure in a row - staying quiet."
+            exit 0
+          fi
+          if [ -z "${NTFY_TOPIC:-}" ]; then
+            echo "::warning::PCTG_NTFY_TOPIC is not set, and the workforce heartbeat has failed twice in a row. Add it under Settings > Secrets and variables > Actions."
+            exit 0
+          fi
+          # jq is preinstalled on the runner, but an alert that silently depends
+          # on it is the kind that goes missing, so there is a printf fallback.
+          # Every character in these strings is ours, so printf is safe here.
+          title="aigen workforce heartbeat DOWN"
+          message="The aigen workforce heartbeat has failed at least twice in a row (last conclusion: ${previous:-unknown}). The workforce may not be ticking, and every department depends on it. A 530 means the runner could not reach the origin - check /api/health and the tunnel, not the app. Run: $RUN_URL"
+          if command -v jq >/dev/null 2>&1; then
+            payload=$(jq -n --arg t "$NTFY_TOPIC" --arg ti "$title" --arg m "$message" \
+              '{topic:$t, title:$ti, message:$m, priority:4, tags:["warning"]}')
+          else
+            payload=$(printf '{"topic":"%s","title":"%s","message":"%s","priority":4}' "$NTFY_TOPIC" "$title" "$message")
+          fi
+          code=$(curl -sS --max-time 20 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d "$payload" https://ntfy.sh || true)
+          [ "${#code}" -eq 3 ] || code=000
+          if [ "$code" != "200" ]; then
+            echo "::error::The alert itself FAILED to send (ntfy HTTP $code). Nobody has been told."
+            exit 1
+          fi
+          echo "Alert sent."
