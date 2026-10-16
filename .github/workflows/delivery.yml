@@ -1,0 +1,111 @@
+# PCTG OPTIMIZER - CUSTOMER DELIVERY PROBE.
+#
+# WHY THIS EXISTS, measured 2026-10-16:
+#   https://pctgopt.pctechguyonline.com/download answered HTTP 302 to a perfectly
+#   correct-looking GitHub "latest release asset" URL, and every dashboard read
+#   green, while a paying customer who clicked it got a 404. The release repo
+#   Sfitz79/pctg-system-optimizer had been flipped to PRIVATE, so release assets
+#   404 for every unauthenticated caller - while any check made with a GitHub
+#   token, or from the Boss's own logged-in browser, still passed. It stayed
+#   broken for five days because nothing here ever followed the redirect.
+#
+# WHAT IT CHECKS, in the order a customer hits it:
+#   1. /download follows the whole chain, unauthenticated, and lands on the real
+#      release-asset CDN.
+#   2. The bytes that arrive are the bytes we shipped - the pinned size, not just
+#      a 200. A 200 serving an HTML error page is not delivery.
+#   3. The portable zip, for the buyer who declines the installer.
+#   4. Both revenue sites answer 200.
+#
+# NO SECRETS ARE USED, AND NONE MAY BE. This job must be able to prove what an
+# anonymous customer sees; giving it a token would recreate the exact blind spot
+# it exists to close.
+#
+# PINNED SIZES: bump EXPECT_INSTALLER / EXPECT_PORTABLE when a new release is
+# published. A mismatch fails this job on purpose - a size that is not what we
+# shipped means the customer is downloading something we did not build.
+
+name: PCTG Optimizer delivery
+
+on:
+  schedule:
+    # Every 6 hours, at :17 rather than :00 - a top-of-hour cron joins every other
+    # scheduled job on the planet and GitHub delays queued runs.
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: pctg-delivery
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: Probe the download chain
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Unauthenticated delivery probe
+        env:
+          EXPECT_INSTALLER: '115564467'
+          EXPECT_PORTABLE: '163892293'
+        run: |
+          set -u
+          fail=0
+
+          probe() {
+            label="$1"; url="$2"; expected="$3"
+            headers=$(mktemp); body=$(mktemp)
+            # curl prints its own 000 on a connection failure, so `|| echo 000`
+            # would concatenate into 000000 - normalise to a single 000 instead.
+            code=$(curl -sSL -r 0-0 -D "$headers" -o "$body" -w '%{http_code}' --max-time 120 "$url" || true)
+            [ "${#code}" -eq 3 ] || code=000
+            final=$(curl -sS -L -r 0-0 -o /dev/null -w '%{url_effective}' --max-time 120 "$url" || true)
+            host=$(printf '%s' "$final" | sed -E 's#^https?://([^/]+).*#\1#')
+            total=$(grep -i '^content-range:' "$headers" | tail -n1 | tr -d '\r' | awk -F/ '{print $2}' | awk '{print $1}')
+
+            echo "== $label: HTTP $code, total ${total:-none} bytes, host ${host:-unknown}"
+
+            if [ "$code" != "206" ] && [ "$code" != "200" ]; then
+              if [ "$code" = "404" ]; then
+                echo "::error::$label returned HTTP 404. The usual cause is Sfitz79/pctg-system-optimizer being PRIVATE - release assets 404 for every customer while logged-in checks still pass. Fix: gh api -X PATCH repos/Sfitz79/pctg-system-optimizer -f private=false"
+              else
+                echo "::error::$label returned HTTP $code and never delivered the binary. A 000 here means curl could not reach the URL at all."
+              fi
+              fail=1
+              return
+            fi
+            case "$host" in
+              release-assets.githubusercontent.com) ;;
+              *) echo "::error::$label did not land on the GitHub release-asset CDN ($host). The redirect is not reaching the real binary."
+                 fail=1; return ;;
+            esac
+            if [ "${total:-0}" -lt 1000000 ]; then
+              echo "::error::$label returned no usable body (content-range total '${total:-none}'). That is an auth wall or an error page, not the binary."
+              fail=1; return
+            fi
+            if [ "${total:-0}" != "$expected" ]; then
+              echo "::error::$label served $total bytes, expected $expected. That is not the artifact we shipped."
+              fail=1; return
+            fi
+            echo "OK $label ($total bytes)"
+          }
+
+          probe "optimizer /download" "https://pctgopt.pctechguyonline.com/download" "$EXPECT_INSTALLER"
+          probe "portable zip" "https://github.com/Sfitz79/pctg-system-optimizer/releases/download/v1.3.0/pctg-optimizer-portable.zip" "$EXPECT_PORTABLE"
+
+          for site in https://pctechguy.app https://pctgopt.pctechguyonline.com; do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 60 "$site" || true)
+            [ "${#code}" -eq 3 ] || code=000
+            echo "== $site HTTP $code"
+            if [ "$code" != "200" ]; then
+              echo "::error::$site returned HTTP $code"
+              fail=1
+            fi
+          done
+
+          if [ "$fail" -eq 0 ]; then
+            echo "PASS a customer with no GitHub login can still reach both binaries at their real size."
+          else
+            echo "::error::CUSTOMERS CANNOT DOWNLOAD WHAT THEY PAID FOR."
+          fi
+          exit "$fail"
