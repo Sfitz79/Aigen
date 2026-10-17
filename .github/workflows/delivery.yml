@@ -21,9 +21,13 @@
 # anonymous customer sees; giving it a token would recreate the exact blind spot
 # it exists to close.
 #
-# PINNED SIZES: bump EXPECT_INSTALLER / EXPECT_PORTABLE when a new release is
-# published. A mismatch fails this job on purpose - a size that is not what we
-# shipped means the customer is downloading something we did not build.
+# PINNED SIZES: these are the sizes of the artifacts in v1.4.0 (the release the
+# storefront serves as "latest"). Bump all three - the two sizes and the tag - when
+# a new release is published. A mismatch fails this job on purpose: a size that is
+# not what we shipped means the customer is downloading something we did not build.
+# Measured 2026-10-17: a newly uploaded GitHub asset can serve 404 for a minute or
+# two after the API reports it as uploaded, so the job retries the whole matrix once
+# before declaring the customer unable to download. A genuine break still fails.
 
 name: PCTG Optimizer delivery
 
@@ -46,8 +50,8 @@ jobs:
     steps:
       - name: Unauthenticated delivery probe
         env:
-          EXPECT_INSTALLER: '115564467'
-          EXPECT_PORTABLE: '163892293'
+          EXPECT_INSTALLER: '115590162'
+          EXPECT_PORTABLE: '163919216'
         run: |
           set -u
           fail=0
@@ -90,8 +94,16 @@ jobs:
             echo "OK $label ($total bytes)"
           }
 
-          probe "optimizer /download" "https://pctgopt.pctechguyonline.com/download" "$EXPECT_INSTALLER"
-          probe "portable zip" "https://github.com/Sfitz79/pctg-system-optimizer/releases/download/v1.3.0/pctg-optimizer-portable.zip" "$EXPECT_PORTABLE"
+          run_matrix() {
+            probe "optimizer /download" "https://pctgopt.pctechguyonline.com/download" "$EXPECT_INSTALLER"
+            probe "optimizer /portable" "https://pctgopt.pctechguyonline.com/portable" "$EXPECT_PORTABLE"
+          }
+
+          # One retry, because a freshly uploaded GitHub release asset has been
+          # measured serving 404 for ~100 seconds while the API already reports it
+          # as uploaded. Without this the job would page the Boss during every
+          # release. It still fails on anything that does not clear within ~90s.
+          run_matrix || { echo "retrying once in 45s (fresh release assets can lag)..."; sleep 45; run_matrix; }
 
           for site in https://pctechguy.app https://pctgopt.pctechguyonline.com; do
             code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 60 "$site" || true)
