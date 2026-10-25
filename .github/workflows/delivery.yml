@@ -21,7 +21,7 @@
 # anonymous customer sees; giving it a token would recreate the exact blind spot
 # it exists to close.
 #
-# PINNED SIZES: these are the sizes of the artifacts in v1.4.0 (the release the
+# PINNED SIZES: these are the sizes of the artifacts in v1.5.0 (the release the
 # storefront serves as "latest"). Bump all three - the two sizes and the tag - when
 # a new release is published. A mismatch fails this job on purpose: a size that is
 # not what we shipped means the customer is downloading something we did not build.
@@ -50,8 +50,8 @@ jobs:
     steps:
       - name: Unauthenticated delivery probe
         env:
-          EXPECT_INSTALLER: '115590162'
-          EXPECT_PORTABLE: '163919216'
+          EXPECT_INSTALLER: '115981741'
+          EXPECT_PORTABLE: '164324198'
         run: |
           set -u
           fail=0
@@ -76,34 +76,36 @@ jobs:
                 echo "::error::$label returned HTTP $code and never delivered the binary. A 000 here means curl could not reach the URL at all."
               fi
               fail=1
-              return
+              return 1
             fi
             case "$host" in
               release-assets.githubusercontent.com) ;;
               *) echo "::error::$label did not land on the GitHub release-asset CDN ($host). The redirect is not reaching the real binary."
-                 fail=1; return ;;
+                 fail=1; return 1 ;;
             esac
             if [ "${total:-0}" -lt 1000000 ]; then
               echo "::error::$label returned no usable body (content-range total '${total:-none}'). That is an auth wall or an error page, not the binary."
-              fail=1; return
+              fail=1; return 1
             fi
             if [ "${total:-0}" != "$expected" ]; then
               echo "::error::$label served $total bytes, expected $expected. That is not the artifact we shipped."
-              fail=1; return
+              fail=1; return 1
             fi
             echo "OK $label ($total bytes)"
           }
 
           run_matrix() {
-            probe "optimizer /download" "https://pctgopt.pctechguyonline.com/download" "$EXPECT_INSTALLER"
-            probe "optimizer /portable" "https://pctgopt.pctechguyonline.com/portable" "$EXPECT_PORTABLE"
+            fail=0
+            probe "optimizer /download" "https://pctgopt.pctechguyonline.com/download" "$EXPECT_INSTALLER" || true
+            probe "optimizer /portable" "https://pctgopt.pctechguyonline.com/portable" "$EXPECT_PORTABLE" || true
+            return "$fail"
           }
 
           # One retry, because a freshly uploaded GitHub release asset has been
           # measured serving 404 for ~100 seconds while the API already reports it
           # as uploaded. Without this the job would page the Boss during every
           # release. It still fails on anything that does not clear within ~90s.
-          run_matrix || { echo "retrying once in 45s (fresh release assets can lag)..."; sleep 45; run_matrix; }
+          run_matrix || { echo "retrying once in 45s (fresh release assets can lag)..."; sleep 45; run_matrix || true; }
 
           for site in https://pctechguy.app https://pctgopt.pctechguyonline.com; do
             code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 60 "$site" || true)
@@ -118,6 +120,6 @@ jobs:
           if [ "$fail" -eq 0 ]; then
             echo "PASS a customer with no GitHub login can still reach both binaries at their real size."
           else
-            echo "::error::CUSTOMERS CANNOT DOWNLOAD WHAT THEY PAID FOR."
+            echo "::error::Customer delivery verification failed. Inspect the annotations above for availability or artifact-version mismatches."
           fi
           exit "$fail"
